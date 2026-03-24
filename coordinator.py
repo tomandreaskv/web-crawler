@@ -47,15 +47,15 @@ def get_redis():
 def ensure_selectors(sites, db_file):
     """
     Sjekk om selektorer er gyldige og ferske for hvert nettsted.
-    - Hvis ingen selektorer finnes i DB → kjør auto-oppdagelse
-    - Hvis selektorer er eldre enn SELECTOR_MAX_AGE_DAYS → re-valider mot live side
-    - Hvis validering feiler → kjør auto-oppdagelse på nytt
-    Krever ANTHROPIC_API_KEY for oppdagelse. Bruker config.py-selektorer som siste utvei.
+    - Ingen selektorer i DB → kjør heuristisk oppdagelse
+    - Eldre enn SELECTOR_MAX_AGE_DAYS → re-valider mot live side
+    - Validering feiler → kjør oppdagelse på nytt
+    AI (Claude) brukes kun hvis ANTHROPIC_API_KEY er satt OG --ai-flagg sendes til
+    selector_discovery.py manuelt. Koordinatoren bruker alltid heuristikk.
     """
-    from datetime import datetime, timedelta
+    from datetime import timedelta
     from selector_discovery import discover, validate_existing
 
-    api_key_set = bool(os.getenv("ANTHROPIC_API_KEY"))
     stale_after = datetime.now() - timedelta(days=SELECTOR_MAX_AGE_DAYS)
 
     for site in sites:
@@ -65,42 +65,28 @@ def ensure_selectors(sites, db_file):
         record   = get_selectors(site, db_file)
 
         if record and record["valid"]:
-            # Sjekk alder
             discovered = datetime.strptime(record["discovered_at"], "%Y-%m-%d %H:%M:%S")
             if discovered > stale_after:
-                logger.info(f"'{site}': selektorer er ferske ({record['discovered_at']}) — ingen handling")
+                logger.info(f"'{site}': selektorer er ferske ({record['discovered_at']})")
                 continue
 
             logger.info(f"'{site}': selektorer er {(datetime.now() - discovered).days} dager gamle — re-validerer")
-            still_valid = validate_existing(site, db_file)
-            if still_valid:
+            if validate_existing(site, db_file):
                 continue
-            logger.warning(f"'{site}': nettsiden har endret seg — starter re-oppdagelse")
-
+            logger.warning(f"'{site}': nettsiden har endret seg — re-oppdager")
         else:
             if record:
                 logger.warning(f"'{site}': forrige oppdagelse var ugyldig — prøver på nytt")
             else:
-                logger.info(f"'{site}': ingen selektorer i DB — starter oppdagelse")
-
-        # Kjør oppdagelse
-        if not api_key_set:
-            if site_cfg.get("selectors"):
-                logger.warning(
-                    f"'{site}': ANTHROPIC_API_KEY mangler — bruker selektorer fra config.py"
-                )
-            else:
-                logger.error(
-                    f"'{site}': ANTHROPIC_API_KEY mangler og ingen selektorer i config.py. "
-                    "Sett ANTHROPIC_API_KEY eller legg til selektorer manuelt."
-                )
-            continue
+                logger.info(f"'{site}': ingen selektorer i DB — starter heuristisk oppdagelse")
 
         if not base_url:
-            logger.error(f"'{site}': base_url mangler i config.py — kan ikke oppdage")
+            logger.error(f"'{site}': base_url mangler i config.py — kan ikke oppdage selektorer")
             continue
 
-        discover(base_url + "0", is_dyn, site, db_file)
+        result = discover(base_url + "0", is_dyn, site, db_file, use_ai=False)
+        if not result and site_cfg.get("selectors"):
+            logger.warning(f"'{site}': heuristikk feilet — faller tilbake til config.py-selektorer")
 
 
 def seed_queues(r, sites, reset=True):
