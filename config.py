@@ -1,3 +1,5 @@
+import os
+
 # Legg til nye nettsteder her ved å definere selektorer — ingen kodeendringer nødvendig
 SITES = {
     "msorensen": {
@@ -14,7 +16,34 @@ SITES = {
     },
 }
 
-REQUEST_DELAY = 1.5   # sekunder mellom sider
-DATABASE_FILE = "products.db"
-MAX_RETRIES = 3
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+REQUEST_DELAY  = 1.5
+DATABASE_FILE  = os.getenv("DATABASE_FILE", "products.db")
+MAX_RETRIES    = 3
+HEADERS        = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+LOG_FILE       = os.getenv("LOG_FILE", "crawler.log")
+LOG_ROTATION   = "10 MB"
+
+# --- Varslinger ---
+# Konfigurer via miljøvariabler eller rediger direkte her.
+NOTIFICATIONS = {
+    "email": {
+        "enabled":   False,
+        "smtp_host": os.getenv("SMTP_HOST", "smtp.gmail.com"),
+        "smtp_port": int(os.getenv("SMTP_PORT", "587")),
+        "username":  os.getenv("SMTP_USER", ""),
+        "password":  os.getenv("SMTP_PASSWORD", ""),
+        "from_addr": os.getenv("SMTP_FROM", ""),
+        "to_addrs":  [a for a in os.getenv("NOTIFY_EMAIL", "").split(",") if a],
+    },
+    "slack": {
+        "enabled":     False,
+        "webhook_url": os.getenv("SLACK_WEBHOOK", ""),
+    },
+}
+
+# Aktiver kanaler automatisk hvis env-variabler er satt
+if NOTIFICATIONS["email"]["to_addrs"] and NOTIFICATIONS["email"]["username"]:
+    NOTIFICATIONS["email"]["enabled"] = True
+if NOTIFICATIONS["slack"]["webhook_url"]:
+    NOTIFICATIONS["slack"]["enabled"] = True

@@ -1,0 +1,42 @@
+services:
+
+  crawler:
+    build: .
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DATABASE_FILE=/app/data/products.db
+      - LOG_FILE=/app/data/crawler.log
+      # Varsling via miljøvariabler (valgfritt):
+      # - SMTP_HOST=smtp.gmail.com
+      # - SMTP_PORT=587
+      # - SMTP_USER=din@gmail.com
+      # - SMTP_PASSWORD=passord
+      # - SMTP_FROM=din@gmail.com
+      # - NOTIFY_EMAIL=mottaker@eksempel.no
+      # - SLACK_WEBHOOK=https://hooks.slack.com/services/...
+    command: ["--schedule", "02:00", "--format", "csv,json", "--notify"]
+
+  api:
+    build: .
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DATABASE_FILE=/app/data/products.db
+    ports:
+      - "8000:8000"
+    entrypoint: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      - crawler
+
+  dashboard:
+    build: .
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DATABASE_FILE=/app/data/products.db
+    ports:
+      - "8501:8501"
+    entrypoint: ["streamlit", "run", "dashboard.py", "--server.address", "0.0.0.0"]
+    depends_on:
+      - crawler

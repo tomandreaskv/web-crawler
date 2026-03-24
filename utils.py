@@ -7,7 +7,18 @@ import pandas as pd
 import schedule
 from loguru import logger
 
-from config import REQUEST_DELAY, DATABASE_FILE, SITES
+from config import REQUEST_DELAY, DATABASE_FILE, SITES, LOG_FILE, LOG_ROTATION
+
+
+def setup_file_logging():
+    """Aktiverer logging til fil i tillegg til terminalen."""
+    logger.add(
+        LOG_FILE,
+        rotation=LOG_ROTATION,
+        encoding="utf-8",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
+        level="DEBUG",
+    )
 
 
 def build_arg_parser():
@@ -44,6 +55,24 @@ def build_arg_parser():
         "--schedule", default="", metavar="INTERVAL",
         help="Kjør automatisk på intervall: 30m, 2h, eller klokkeslett 02:00",
     )
+    # --- Filtre ---
+    parser.add_argument(
+        "--filter-title", default="", metavar="TEKST",
+        help="Behold kun produkter der tittelen inneholder denne teksten (case-insensitivt)",
+    )
+    parser.add_argument(
+        "--filter-max-price", type=float, default=None, metavar="BELØP",
+        help="Behold kun produkter med pris <= BELØP",
+    )
+    parser.add_argument(
+        "--filter-in-stock", action="store_true",
+        help="Behold kun produkter som er på lager",
+    )
+    # --- Varsling ---
+    parser.add_argument(
+        "--notify", action="store_true",
+        help="Send e-post / Slack-varsling ved prisendringer (krever SMTP/Slack-konfig)",
+    )
     return parser
 
 
@@ -63,6 +92,36 @@ def check_robots_txt(url):
     except Exception as e:
         logger.warning(f"Kunne ikke lese robots.txt ({e}) — fortsetter likevel.")
         return True
+
+
+def apply_filters(records, args):
+    """Filtrerer produktlisten basert på CLI-flagg."""
+    original = len(records)
+    result = records
+
+    if getattr(args, "filter_title", None):
+        needle = args.filter_title.lower()
+        result = [r for r in result if needle in r.get("Title", "").lower()]
+
+    if getattr(args, "filter_max_price", None) is not None:
+        def _parse(p):
+            try:
+                return float(
+                    str(p).replace("\xa0", "").replace(" ", "")
+                    .replace(",", ".").replace("kr", "").strip()
+                )
+            except (ValueError, TypeError):
+                return float("inf")
+        result = [r for r in result if _parse(r.get("Price", "")) <= args.filter_max_price]
+
+    if getattr(args, "filter_in_stock", False):
+        result = [r for r in result if r.get("Quantity", "").strip() not in ("", "0")]
+
+    removed = original - len(result)
+    if removed:
+        logger.info(f"Filter: fjernet {removed} produkter, {len(result)} gjenstår.")
+
+    return result
 
 
 def export_data(records, output_base, formats):

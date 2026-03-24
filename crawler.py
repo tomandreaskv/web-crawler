@@ -7,10 +7,19 @@ import requests
 from bs4 import BeautifulSoup
 from loguru import logger
 
-from config import SITES, MAX_RETRIES, HEADERS
-from db import save_products, get_last_two_scrapes
+from alerts import check_alerts
+from config import SITES, MAX_RETRIES, HEADERS, NOTIFICATIONS
+from db import save_products, get_last_two_scrapes, start_run, finish_run
+from notifier import notify_price_changes
 from reporter import generate_diff, print_report
-from utils import build_arg_parser, check_robots_txt, export_data, run_on_schedule
+from utils import (
+    build_arg_parser,
+    check_robots_txt,
+    export_data,
+    apply_filters,
+    run_on_schedule,
+    setup_file_logging,
+)
 
 
 def current_time():
@@ -67,7 +76,7 @@ def _scrape_page(url, proxy=None):
     return records
 
 
-def scrape_page_with_retry(url, proxy=None):
+def _scrape_with_retry(url, proxy=None):
     for attempt in range(MAX_RETRIES):
         try:
             return _scrape_page(url, proxy)
@@ -90,10 +99,13 @@ def run_crawl(args):
         logger.error("Scraping ikke tillatt av robots.txt. Avbryter.")
         return
 
+    run_id = start_run(args.site, args.db)
     all_records = []
-    page = 0
+    pages_scraped = 0
+    error_msg = None
 
     try:
+        page = 0
         while True:
             if args.pages and page >= args.pages:
                 break
@@ -106,36 +118,54 @@ def run_crawl(args):
             url = base_url + str(page)
             logger.info(f"Side {page}: {url}" + (f" (proxy: {proxy})" if proxy else ""))
 
-            records = scrape_page_with_retry(url, proxy)
+            records = _scrape_with_retry(url, proxy)
             if records is None:
                 logger.info(f"Ingen produkter på side {page} — ferdig.")
                 break
 
             all_records.extend(records)
+            pages_scraped = page + 1
             logger.success(f"Side {page}: {len(records)} produkter")
             page += 1
             time.sleep(args.delay)
 
     except KeyboardInterrupt:
         logger.warning("Avbrutt av bruker.")
+        error_msg = "interrupted"
+    except Exception as e:
+        logger.error(f"Uventet feil: {e}")
+        error_msg = str(e)
+
+    status = "error" if error_msg and error_msg != "interrupted" else (
+        "interrupted" if error_msg == "interrupted" else "ok"
+    )
+    finish_run(run_id, status, pages_scraped, len(all_records), error_msg, args.db)
 
     if not all_records:
         logger.warning("Ingen data å lagre.")
         return
+
+    all_records = apply_filters(all_records, args)
 
     save_products(all_records, args.site, args.db)
     export_data(all_records, args.output, formats)
 
     latest, previous = get_last_two_scrapes(args.site, args.db)
     if previous:
-        print_report(generate_diff(previous, latest))
+        report = generate_diff(previous, latest)
+        print_report(report)
+        if args.notify:
+            notify_price_changes(report, NOTIFICATIONS)
     else:
         logger.info("Første kjøring — ingen tidligere data å sammenligne med.")
+
+    check_alerts(all_records, args.site, args.db, NOTIFICATIONS)
 
 
 def main():
     logger.remove()
     logger.add(sys.stdout, format="{time:HH:mm:ss} | {level} | {message}", level="INFO")
+    setup_file_logging()
 
     args = build_arg_parser().parse_args()
     logger.info(f"Starter statisk crawler for '{args.site}'...")
