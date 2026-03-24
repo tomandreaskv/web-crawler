@@ -1,4 +1,6 @@
+import hashlib
 import json
+import os
 import sqlite3
 from datetime import datetime
 
@@ -59,8 +61,27 @@ def _connect(db_file):
             discovered_at TEXT NOT NULL,
             validated_at  TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS webhooks (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            url        TEXT NOT NULL,
+            site       TEXT,           -- NULL = alle nettsteder
+            event_type TEXT NOT NULL DEFAULT 'all',  -- 'price_change', 'new_product', 'back_in_stock', 'all'
+            secret     TEXT,           -- valgfri HMAC-nøkkel for signaturverifisering
+            created_at TEXT NOT NULL,
+            active     INTEGER DEFAULT 1
+        );
     """)
     conn.commit()
+
+    # Migrer eksisterende databaser: legg til product_hash-kolonne hvis den mangler
+    for col in [("products", "product_hash", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE {col[0]} ADD COLUMN {col[1]} {col[2]}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
     return conn
 
 
@@ -71,30 +92,50 @@ def _connect(db_file):
 def save_products(records, site, db_file):
     conn = _connect(db_file)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    rows = [
-        (
-            site,
-            r.get("Product number", ""),
-            r.get("Title", ""),
-            r.get("Description", ""),
-            r.get("Price", ""),
-            r.get("Quantity", ""),
-            r.get("Link", ""),
-            now,
+    inserted = 0
+    skipped = 0
+
+    for rec in records:
+        product_number = rec.get("Product number", "")
+        price    = rec.get("Price", "")
+        quantity = rec.get("Quantity", "")
+        product_hash = hashlib.md5(f"{price}|{quantity}".encode()).hexdigest()
+
+        # Deduplisering: hopp over rader der pris og lagerstatus ikke har endret seg
+        if product_number:
+            existing = conn.execute(
+                "SELECT product_hash FROM products WHERE site = ? AND product_number = ? "
+                "ORDER BY scraped_at DESC LIMIT 1",
+                (site, product_number),
+            ).fetchone()
+            if existing and existing[0] == product_hash:
+                skipped += 1
+                continue
+
+        conn.execute(
+            """
+            INSERT INTO products
+                (site, product_number, title, description, price, quantity, link, scraped_at, product_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                site,
+                product_number,
+                rec.get("Title", ""),
+                rec.get("Description", ""),
+                price,
+                quantity,
+                rec.get("Link", ""),
+                now,
+                product_hash,
+            ),
         )
-        for r in records
-    ]
-    conn.executemany(
-        """
-        INSERT INTO products
-            (site, product_number, title, description, price, quantity, link, scraped_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        rows,
-    )
+        inserted += 1
+
     conn.commit()
     conn.close()
-    logger.success(f"Lagret {len(rows)} produkter til databasen ({db_file})")
+    logger.success(f"Lagret {inserted} produkter til databasen ({db_file}) — {skipped} uendret hoppes over")
+    _mirror_to_external(records, site, now)
 
 
 def get_last_two_scrapes(site, db_file):
@@ -360,3 +401,57 @@ def get_selector_history(site, db_file):
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Webhooks
+# ---------------------------------------------------------------------------
+
+def save_webhook(url, site, event_type, secret, db_file):
+    conn = _connect(db_file)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor = conn.execute(
+        "INSERT INTO webhooks (url, site, event_type, secret, created_at) VALUES (?, ?, ?, ?, ?)",
+        (url, site, event_type, secret, now)
+    )
+    wid = cursor.lastrowid
+    conn.commit(); conn.close()
+    return wid
+
+def get_webhooks(db_file, site=None):
+    conn = _connect(db_file)
+    if site:
+        rows = conn.execute(
+            "SELECT * FROM webhooks WHERE active=1 AND (site=? OR site IS NULL)", (site,)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM webhooks WHERE active=1").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def delete_webhook(webhook_id, db_file):
+    conn = _connect(db_file)
+    conn.execute("UPDATE webhooks SET active=0 WHERE id=?", (webhook_id,))
+    conn.commit(); conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Ekstern DB-mirror
+# ---------------------------------------------------------------------------
+
+def _mirror_to_external(records, site, scraped_at):
+    """Optionally mirror data to PostgreSQL/MySQL via DATABASE_URL env var."""
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url or not records:
+        return
+    try:
+        import pandas as pd
+        from sqlalchemy import create_engine
+        engine = create_engine(db_url, pool_pre_ping=True)
+        df = pd.DataFrame(records)
+        df["site"] = site
+        df["scraped_at"] = scraped_at
+        df.to_sql("products", engine, if_exists="append", index=False)
+        logger.debug(f"Speilte {len(records)} rader til ekstern DB")
+    except Exception as e:
+        logger.warning(f"Ekstern DB-mirror feilet: {e}")

@@ -8,9 +8,13 @@ Dokumentasjon:
   http://localhost:8000/docs
 """
 
+import hashlib
+import hmac
+import json as _json
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from loguru import logger
 from pydantic import BaseModel
 
 from config import DATABASE_FILE, SITES
@@ -24,6 +28,9 @@ from db import (
     get_products,
     get_run,
     get_runs,
+    save_webhook,
+    get_webhooks,
+    delete_webhook,
 )
 from reporter import generate_diff
 
@@ -69,17 +76,42 @@ def product_history(
 # Diff-rapport
 # ---------------------------------------------------------------------------
 
+def _deliver_webhooks(diff_result: dict, site: str, db_file: str):
+    """Fire registered webhooks with the diff payload."""
+    import requests as _req
+    hooks = get_webhooks(db_file, site=site)
+    if not hooks:
+        return
+    payload = _json.dumps({"site": site, "event": "diff", "data": diff_result}, ensure_ascii=False, default=str)
+    for hook in hooks:
+        if hook["event_type"] not in ("all", "price_change"):
+            continue
+        headers = {"Content-Type": "application/json"}
+        if hook.get("secret"):
+            sig = hmac.new(hook["secret"].encode(), payload.encode(), hashlib.sha256).hexdigest()
+            headers["X-Webhook-Signature"] = sig
+        try:
+            _req.post(hook["url"], data=payload, headers=headers, timeout=10)
+        except Exception as e:
+            logger.warning(f"Webhook {hook['id']} feilet: {e}")
+
+
 @app.get("/diff", summary="Endringsrapport mellom siste to kjøringer")
 def diff(
     site: str = Query("msorensen"),
     db: str = Query(DATABASE_FILE),
+    background_tasks: BackgroundTasks = None,
 ):
     latest, previous = get_last_two_scrapes(site, db)
     if not latest:
         raise HTTPException(status_code=404, detail="Ingen data i databasen ennå.")
     if not previous:
         return {"message": "Kun én kjøring — ingen diff tilgjengelig.", "new_products": [], "removed": [], "price_changes": []}
-    return generate_diff(previous, latest)
+    result = generate_diff(previous, latest)
+    has_changes = any(result.get(k) for k in ("new_products", "removed", "price_changes"))
+    if has_changes and background_tasks:
+        background_tasks.add_task(_deliver_webhooks, result, site, db)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +164,34 @@ def remove_alert(alert_id: int, db: str = Query(DATABASE_FILE)):
         raise HTTPException(status_code=404, detail=f"Varsel {alert_id} ikke funnet.")
     delete_alert(alert_id, db)
     return {"message": f"Varsel {alert_id} slettet."}
+
+
+# ---------------------------------------------------------------------------
+# Webhooks
+# ---------------------------------------------------------------------------
+
+class WebhookCreate(BaseModel):
+    url:        str
+    site:       Optional[str] = None
+    event_type: str = "all"
+    secret:     Optional[str] = None
+
+
+@app.get("/webhooks", summary="Liste over webhooks")
+def list_webhooks(db: str = Query(DATABASE_FILE)):
+    return get_webhooks(db)
+
+
+@app.post("/webhooks", status_code=201, summary="Registrer webhook")
+def create_webhook(body: WebhookCreate, db: str = Query(DATABASE_FILE)):
+    wid = save_webhook(body.url, body.site, body.event_type, body.secret, db)
+    return {"id": wid, "url": body.url, "event_type": body.event_type}
+
+
+@app.delete("/webhooks/{webhook_id}", summary="Slett webhook")
+def remove_webhook(webhook_id: int, db: str = Query(DATABASE_FILE)):
+    delete_webhook(webhook_id, db)
+    return {"message": f"Webhook {webhook_id} slettet."}
 
 
 # ---------------------------------------------------------------------------
