@@ -1,112 +1,149 @@
-import requests
-from bs4 import BeautifulSoup
-from loguru import logger
-from datetime import datetime
-import pandas as pd
 import re
 import sys
 import time
+from datetime import datetime
 
-# --- Konfigurasjon ---
-BASE_URL = "https://www.msorensen.no/sigarer?pageID="
-OUTPUT_FILE = "msorensen_products.csv"
-HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-REQUEST_DELAY = 1.5  # sekunder mellom sider
+import requests
+from bs4 import BeautifulSoup
+from loguru import logger
+
+from config import SITES, MAX_RETRIES, HEADERS
+from db import save_products, get_last_two_scrapes
+from reporter import generate_diff, print_report
+from utils import build_arg_parser, check_robots_txt, export_data, run_on_schedule
 
 
 def current_time():
-    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def scrape_page(page_number):
-    url = BASE_URL + str(page_number)
-    logger.info(f"Scraper side {page_number}: {url}")
+def _scrape_page(url, proxy=None):
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    response = requests.get(url, headers=HEADERS, timeout=10, proxies=proxies)
+    response.raise_for_status()
 
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        response.raise_for_status()
-    except requests.RequestException as e:
-        logger.error(f"Nettverksfeil på side {page_number}: {e}")
-        return None
-
-    soup = BeautifulSoup(response.content, 'html.parser')
-    products = soup.findAll('div', class_='d4-row d4-listing-row')
-
+    soup = BeautifulSoup(response.content, "html.parser")
+    products = soup.findAll("div", class_="d4-row d4-listing-row")
     if not products:
-        logger.info(f"Ingen produkter på side {page_number}, stopper.")
         return None
 
     records = []
     for product in products:
         try:
-            name = product.find('span', class_='product-desc1')
-            description = product.find('span', class_='product-desc2')
-            productnumber = product.find('span', class_='product-desc-prod-num')
-            link = product.find('a', class_='AdProductLink')
+            name          = product.find("span", class_="product-desc1")
+            description   = product.find("span", class_="product-desc2")
+            productnumber = product.find("span", class_="product-desc-prod-num")
+            link          = product.find("a",    class_="AdProductLink")
 
-            quantity = ''
-            stockcontainer = product.find('div', class_='DynamicStockTooltipContainer')
+            quantity = ""
+            stockcontainer = product.find("div", class_="DynamicStockTooltipContainer")
             if stockcontainer:
-                quantity_spans = stockcontainer.findAll('span')
-                if quantity_spans:
-                    quantity = quantity_spans[0].text.strip("()").strip()
+                spans = stockcontainer.findAll("span")
+                if spans:
+                    quantity = spans[0].text.strip("()").strip()
 
-            price = ''
-            pricecontainer = product.find('div', class_='d4-listing-cell d4-col-2 price-cell')
+            price = ""
+            pricecontainer = product.find("div", class_="d4-listing-cell d4-col-2 price-cell")
             if pricecontainer:
-                listprice = pricecontainer.find('div', class_='ListPriceContainer')
+                listprice = pricecontainer.find("div", class_="ListPriceContainer")
                 if listprice:
-                    label = listprice.find('div', class_='PriceLabelContainer')
+                    label = listprice.find("div", class_="PriceLabelContainer")
                     if label:
-                        price_span = label.find('span', id=re.compile(r'^adprice__1680'))
-                        if price_span:
-                            price = price_span.get('content', '')
+                        span = label.find("span", id=re.compile(r"^adprice__1680"))
+                        if span:
+                            price = span.get("content", "")
 
-            record = {
-                'Link': link['href'] if link else '',
-                'Product number': productnumber.text if productnumber else '',
-                'Title': name.text if name else '',
-                'Description': description.text if description else '',
-                'Price': price,
-                'Quantity': quantity,
-                'Date': current_time(),
-            }
-            records.append(record)
+            records.append({
+                "Link":           link["href"] if link else "",
+                "Product number": productnumber.text if productnumber else "",
+                "Title":          name.text          if name          else "",
+                "Description":    description.text   if description   else "",
+                "Price":          price,
+                "Quantity":       quantity,
+                "Date":           current_time(),
+            })
         except Exception as e:
             logger.warning(f"Feil ved produkt: {e}")
-            continue
-
-    logger.success(f"Hentet {len(records)} produkter fra side {page_number}")
     return records
 
 
-def main():
-    logger.remove()
-    logger.add(sys.stdout, format="{time:HH:mm:ss} | {level} | {message}", level="INFO")
-    logger.info("Starter statisk web-crawler...")
+def scrape_page_with_retry(url, proxy=None):
+    for attempt in range(MAX_RETRIES):
+        try:
+            return _scrape_page(url, proxy)
+        except requests.RequestException as e:
+            wait = 2 ** attempt
+            logger.warning(f"Forsøk {attempt + 1}/{MAX_RETRIES} feilet: {e}. Venter {wait}s...")
+            time.sleep(wait)
+    logger.error(f"Alle {MAX_RETRIES} forsøk feilet for {url}")
+    return None
+
+
+def run_crawl(args):
+    site_config = SITES[args.site]
+    base_url    = site_config["base_url"]
+    proxies     = [p.strip() for p in args.proxies.split(",")] if args.proxies else [None]
+    formats     = args.format.split(",")
+    proxy_index = 0
+
+    if not check_robots_txt(base_url):
+        logger.error("Scraping ikke tillatt av robots.txt. Avbryter.")
+        return
 
     all_records = []
     page = 0
 
     try:
         while True:
-            records = scrape_page(page)
-            if records is None:
+            if args.pages and page >= args.pages:
                 break
+
+            proxy = None
+            if proxies[0] is not None:
+                proxy = proxies[proxy_index % len(proxies)]
+                proxy_index += 1
+
+            url = base_url + str(page)
+            logger.info(f"Side {page}: {url}" + (f" (proxy: {proxy})" if proxy else ""))
+
+            records = scrape_page_with_retry(url, proxy)
+            if records is None:
+                logger.info(f"Ingen produkter på side {page} — ferdig.")
+                break
+
             all_records.extend(records)
+            logger.success(f"Side {page}: {len(records)} produkter")
             page += 1
-            time.sleep(REQUEST_DELAY)
+            time.sleep(args.delay)
+
     except KeyboardInterrupt:
         logger.warning("Avbrutt av bruker.")
-    except Exception as e:
-        logger.error(f"Uventet feil: {e}")
 
-    if all_records:
-        df = pd.DataFrame(all_records)
-        df.to_csv(OUTPUT_FILE, index=False, encoding='utf-8')
-        logger.success(f"Lagret {len(all_records)} produkter til {OUTPUT_FILE}")
-    else:
+    if not all_records:
         logger.warning("Ingen data å lagre.")
+        return
+
+    save_products(all_records, args.site, args.db)
+    export_data(all_records, args.output, formats)
+
+    latest, previous = get_last_two_scrapes(args.site, args.db)
+    if previous:
+        print_report(generate_diff(previous, latest))
+    else:
+        logger.info("Første kjøring — ingen tidligere data å sammenligne med.")
+
+
+def main():
+    logger.remove()
+    logger.add(sys.stdout, format="{time:HH:mm:ss} | {level} | {message}", level="INFO")
+
+    args = build_arg_parser().parse_args()
+    logger.info(f"Starter statisk crawler for '{args.site}'...")
+
+    if args.schedule:
+        run_on_schedule(args.schedule, run_crawl, args)
+    else:
+        run_crawl(args)
 
 
 if __name__ == "__main__":
