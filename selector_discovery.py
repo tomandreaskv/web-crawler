@@ -1,19 +1,16 @@
 """
 Auto-oppdagelse av CSS-selektorer for produktlistesider.
 
-Bruker møstergjenkjenning på HTML for å finne produktcontainere og feltselektorer
-uten behov for ekstern AI. Logikken:
+Bruker møstergjenkjenning på HTML for å finne produktcontainere og feltselektorer.
+Logikk:
   1. Tell repetering block-elementer (div/li/article med klasser)
   2. Velg containeren med høyest "produktsignal" (pris + lenke + rimelig tekst)
   3. Finn felt (navn, pris, lenke osv.) inni containeren via klasse-mønstre
-
-Støtter valgfri AI-forbedring via --ai (krever ANTHROPIC_API_KEY).
 
 Bruk:
   python selector_discovery.py --url https://example.com/products --site example
   python selector_discovery.py --url https://example.com/products --site example --dynamic
   python selector_discovery.py --site msorensen --validate
-  python selector_discovery.py --url ... --site ... --ai   # bruk Claude i tillegg
 """
 
 import json
@@ -29,11 +26,9 @@ from loguru import logger
 
 from config import HEADERS, DATABASE_FILE
 
-ANTHROPIC_API_KEY     = os.getenv("ANTHROPIC_API_KEY")
-DISCOVERY_MODEL       = "claude-opus-4-6"
 SELECTOR_MAX_AGE_DAYS = int(os.getenv("SELECTOR_MAX_AGE_DAYS", "7"))
 
-# Mønster for heuristisk feltgjenkjenning
+# Mønstre for feltgjenkjenning
 _PRICE_RE   = re.compile(r"\d+[,.]?\d*\s*(kr|NOK|\$|€|,-)", re.I)
 _NAME_CLS   = re.compile(r"(product.?(name|title|desc1)|item.?name|heading|prod.?name)", re.I)
 _DESC_CLS   = re.compile(r"(desc(?:ription)?2?|summary|product.?body|prod.?desc(?!\d))", re.I)
@@ -104,9 +99,9 @@ def _css_sel(el):
 
 def _find_container(soup):
     """
-    Finn den mest sannsynlige produkt-containeren ved å:
-    1. Telle alle (tag, klasser)-kombinasjoner som repeterer 3+ ganger
-    2. Score hver kandidat basert på pris, lenke og klasse-navn
+    Finn den mest sannsynlige produkt-containeren.
+    Teller alle (tag, klasser)-kombinasjoner som repeterer 3+ ganger og
+    scorer hver kandidat på pris, lenke og klasse-navn.
     """
     counts = Counter()
     for el in soup.find_all(["div", "li", "article", "tr"]):
@@ -114,39 +109,27 @@ def _find_container(soup):
         if classes:
             counts[(el.name, classes)] += 1
 
-    # Behold kun de som repeterer nok
     candidates = [(tag, cls, n) for (tag, cls), n in counts.items() if n >= 3]
 
     best_sel, best_score = None, 0
 
     for tag, classes, count in candidates:
-        cls_str = ".".join(classes)
-        sel     = f"{tag}.{cls_str}"
-        sample  = soup.select_one(sel)
+        sel    = f"{tag}.{'.'.join(classes)}"
+        sample = soup.select_one(sel)
         if not sample:
             continue
 
         score = 0
         text  = sample.get_text(" ", strip=True)
 
-        # Prissignal — det sterkeste indikasjonet på et produktkort
         if _PRICE_RE.search(text):
             score += 4
-
-        # Lenke til produktside
         if sample.find("a"):
             score += 2
-
-        # Rimelig tekstlengde for et produktkort
         if 15 < len(text) < 800:
             score += 1
-
-        # Klasse-navn antyder "produkt"
-        combined_cls = " ".join(classes).lower()
-        if _PROD_CLS.search(combined_cls):
+        if _PROD_CLS.search(" ".join(classes).lower()):
             score += 2
-
-        # Mange repetisjoner = mer sannsynlig produktliste
         if count >= 8:
             score += 1
 
@@ -164,8 +147,8 @@ def _find_container(soup):
 
 def _find_in(container, pattern_re, tag_hints=None):
     """
-    Finn første element i containeren der klasse-navnet matcher pattern_re.
-    Sjekker tag_hints først (f.eks. h2, h3 for navn).
+    Finn første element der klasse-navn matcher pattern_re.
+    Sjekker tag_hints først (f.eks. h2, h3 for produktnavn).
     """
     if tag_hints:
         for tag in tag_hints:
@@ -186,9 +169,9 @@ def _find_price(container):
     """Finn pris-element via tekst-mønster (tall + valuta)."""
     for el in container.find_all(True):
         if _PRICE_RE.search(el.get_text()):
-            # Foretrekk løvnoder (mest spesifikk)
+            # Foretrekk løvnoder (mest spesifikke)
             children = list(el.children)
-            has_sub = any(
+            has_sub  = any(
                 hasattr(c, "find_all") and c.get("class")
                 for c in children
             )
@@ -200,10 +183,9 @@ def _find_price(container):
 
 
 def _find_link(container):
-    """Finn produkt-lenken (a-element) i containeren."""
+    """Finn produkt-lenken i containeren."""
     for el in container.find_all("a"):
         href = el.get("href", "")
-        # Foretrekk lenker som peker til et produkt (ikke kategori/filter)
         if href and not href.startswith("#") and len(href) > 3:
             return _css_sel(el) or "a"
     return None
@@ -216,7 +198,6 @@ def discover_heuristic(html):
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # Fjern støy
     for tag in soup(["script", "style", "svg", "noscript"]):
         tag.decompose()
 
@@ -224,7 +205,6 @@ def discover_heuristic(html):
     if not container_sel:
         return None
 
-    # Ta første container som referanse for felt-søk
     sample = soup.select_one(container_sel)
 
     selectors = {
@@ -237,74 +217,13 @@ def discover_heuristic(html):
         "product_links":  _find_link(sample),
     }
 
-    found = [k for k, v in selectors.items() if v]
+    found   = [k for k, v in selectors.items() if v]
     missing = [k for k, v in selectors.items() if not v]
-    logger.info(f"Heuristikk fant: {found}")
+    logger.info(f"Fant selektorer for: {found}")
     if missing:
         logger.debug(f"Ikke funnet: {missing}")
 
     return selectors
-
-
-# ---------------------------------------------------------------------------
-# Valgfri AI-forbedring (Claude API)
-# ---------------------------------------------------------------------------
-
-def _clean_html(html, max_chars=7000):
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "svg", "head", "noscript", "iframe", "link", "meta"]):
-        tag.decompose()
-    main = (
-        soup.find("main")
-        or soup.find(id=re.compile(r"main|content|product", re.I))
-        or soup.find(class_=re.compile(r"main|content|product.?list", re.I))
-        or soup.body
-        or soup
-    )
-    return re.sub(r"\s+", " ", str(main))[:max_chars]
-
-
-def _discover_with_claude(html_sample, url):
-    """Bruker Claude API for mer presis selektor-oppdagelse."""
-    if not ANTHROPIC_API_KEY:
-        raise EnvironmentError(
-            "ANTHROPIC_API_KEY er ikke satt. "
-            "Eksporter: export ANTHROPIC_API_KEY=sk-ant-..."
-        )
-
-    import anthropic
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    prompt = f"""Du analyserer HTML fra en nettbutikk med produktlisting.
-URL: {url}
-
-Finn CSS-selektorer for disse feltene. Selektorene gjelder for HELE siden.
-
-Felter:
-- container:      repetering beholder per produkt (f.eks. "div.product-item")
-- names:          produktnavn/tittel
-- descriptions:   produktbeskrivelse (null hvis mangler)
-- productnumbers: produktnummer/SKU (null hvis mangler)
-- prices:         pris
-- quantities:     lagerstatus (null hvis mangler)
-- product_links:  lenke til produktside (a-element)
-
-Svar med KUN gyldig JSON — ingen markdown:
-{{"container": "...", "names": "...", "descriptions": null, "productnumbers": null, "prices": "...", "quantities": null, "product_links": "..."}}
-
-HTML:
-{html_sample}"""
-
-    response = client.messages.create(
-        model=DISCOVERY_MODEL,
-        max_tokens=400,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    raw = response.content[0].text.strip()
-    raw = re.sub(r"^```[a-z]*\n?", "", raw)
-    raw = re.sub(r"\n?```$", "", raw)
-    return json.loads(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +238,7 @@ def validate_selectors(selectors, html):
     Tester selektorene mot HTML og teller treff.
     Returnerer (er_gyldig, treff_per_felt, detaljer).
     """
-    soup = BeautifulSoup(html, "html.parser")
+    soup    = BeautifulSoup(html, "html.parser")
     details = {}
 
     for field, selector in selectors.items():
@@ -346,9 +265,9 @@ def validate_selectors(selectors, html):
 # Hoved-inngang
 # ---------------------------------------------------------------------------
 
-def discover(url, is_dynamic=False, site=None, db_file=None, use_ai=False):
+def discover(url, is_dynamic=False, site=None, db_file=None):
     """
-    Full oppdagelse: henter HTML → heuristikk → (valgfritt AI) → validerer → lagrer.
+    Full oppdagelse: henter HTML → heuristisk analyse → validerer → lagrer i DB.
     Returnerer selektorer-dict hvis vellykket, None ved feil.
     """
     logger.info(f"Starter selektor-oppdagelse for: {url}")
@@ -360,23 +279,7 @@ def discover(url, is_dynamic=False, site=None, db_file=None, use_ai=False):
         logger.error(f"Kunne ikke hente siden: {e}")
         return None
 
-    # Heuristisk oppdagelse (alltid)
     selectors = discover_heuristic(html)
-
-    # Valgfri AI-forbedring
-    if use_ai and ANTHROPIC_API_KEY:
-        logger.info("Kjører AI-forbedring via Claude API ...")
-        try:
-            ai_selectors = _discover_with_claude(_clean_html(html), url)
-            # Merge: fyll inn felt heuristikken ikke fant, AI tar over der den er bedre
-            for field, val in ai_selectors.items():
-                if val and not selectors.get(field):
-                    selectors[field] = val
-                    logger.debug(f"AI fylte inn manglende felt: {field}")
-        except Exception as e:
-            logger.warning(f"AI-forbedring feilet (fortsetter med heuristikk): {e}")
-    elif use_ai and not ANTHROPIC_API_KEY:
-        logger.warning("--ai er satt men ANTHROPIC_API_KEY mangler — hopper over AI")
 
     if not selectors:
         logger.error("Heuristikken fant ingen produktcontainer")
@@ -452,7 +355,6 @@ if __name__ == "__main__":
     parser.add_argument("--site",     default="ukjent", help="Nettsted-ID (lagres i DB)")
     parser.add_argument("--dynamic",  action="store_true", help="Bruk Selenium for JavaScript-sider")
     parser.add_argument("--validate", action="store_true", help="Valider eksisterende selektorer")
-    parser.add_argument("--ai",       action="store_true", help="Bruk Claude API for forbedret oppdagelse")
     parser.add_argument("--db",       default=DATABASE_FILE)
     args = parser.parse_args()
 
@@ -463,7 +365,7 @@ if __name__ == "__main__":
     if not args.url:
         parser.error("--url er påkrevd (med mindre du bruker --validate)")
 
-    result = discover(args.url, args.dynamic, args.site, args.db, use_ai=args.ai)
+    result = discover(args.url, args.dynamic, args.site, args.db)
     if result:
         print("\nOppdagede selektorer:")
         print(json.dumps(result, indent=2, ensure_ascii=False))

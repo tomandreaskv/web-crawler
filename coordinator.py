@@ -50,8 +50,6 @@ def ensure_selectors(sites, db_file):
     - Ingen selektorer i DB → kjør heuristisk oppdagelse
     - Eldre enn SELECTOR_MAX_AGE_DAYS → re-valider mot live side
     - Validering feiler → kjør oppdagelse på nytt
-    AI (Claude) brukes kun hvis ANTHROPIC_API_KEY er satt OG --ai-flagg sendes til
-    selector_discovery.py manuelt. Koordinatoren bruker alltid heuristikk.
     """
     from datetime import timedelta
     from selector_discovery import discover, validate_existing
@@ -84,7 +82,7 @@ def ensure_selectors(sites, db_file):
             logger.error(f"'{site}': base_url mangler i config.py — kan ikke oppdage selektorer")
             continue
 
-        result = discover(base_url + "0", is_dyn, site, db_file, use_ai=False)
+        result = discover(base_url + "0", is_dyn, site, db_file)
         if not result and site_cfg.get("selectors"):
             logger.warning(f"'{site}': heuristikk feilet — faller tilbake til config.py-selektorer")
 
