@@ -6,6 +6,7 @@ SITES = {
         "name": "M. Sørensen",
         "base_url": "https://www.msorensen.no/sigarer?pageID=",
         "dynamic": True,   # krever JavaScript-rendering (Selenium)
+        "schedule": "02:00",
         "selectors": {
             "names":          ("css",   "span.product-desc1"),
             "descriptions":   ("css",   "span.product-desc2"),
@@ -25,6 +26,10 @@ REQUEST_DELAY  = 1.5
 DATABASE_FILE  = os.getenv("DATABASE_FILE", "products.db")
 MAX_RETRIES    = 3
 HEADERS        = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+CIRCUIT_FAILURE_THRESHOLD = int(os.getenv("CIRCUIT_FAILURE_THRESHOLD", "5"))
+CIRCUIT_RESET_TIMEOUT     = int(os.getenv("CIRCUIT_RESET_TIMEOUT", "600"))
+ROBOTS_CACHE_TTL          = int(os.getenv("ROBOTS_CACHE_TTL", "3600"))
 
 LOG_FILE       = os.getenv("LOG_FILE", "crawler.log")
 LOG_ROTATION   = "10 MB"

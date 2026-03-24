@@ -180,9 +180,12 @@ def print_status(r, sites):
     stats, workers = get_status(r, sites)
     logger.info("─" * 65)
     for site, s in stats.items():
+        circuit = r.hgetall(f"circuit:{site}")
+        circuit_state = circuit.get("state", "closed") if circuit else "closed"
         logger.info(
             f"  {site:<16} | kø: {s['queue']:>4} | sider: {s['pages']:>5} "
-            f"| produkter: {s['products']:>6} | uttømt: {s['exhausted']}"
+            f"| produkter: {s['products']:>6} | uttømt: {s['exhausted']} "
+            f"| circuit: {circuit_state}"
         )
     if workers:
         logger.info(f"  Workers ({len(workers)}):")
@@ -201,6 +204,46 @@ def print_status(r, sites):
             )
     else:
         logger.info("  Ingen workers tilkoblet ennå — venter...")
+
+
+# ---------------------------------------------------------------------------
+# Planlagt kjøring
+# ---------------------------------------------------------------------------
+
+def _should_run_schedule(schedule_str, last_run_iso):
+    """
+    Returns True if the schedule has triggered since last_run.
+    schedule_str: "02:00" (daily at time), "6h" (every 6 hours), "30m" (every 30 min)
+    """
+    now = datetime.now()
+    if not last_run_iso:
+        return True
+    last = datetime.fromisoformat(last_run_iso)
+
+    if ":" in schedule_str:  # "HH:MM" — daglig
+        h, m = map(int, schedule_str.split(":"))
+        scheduled_today = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        return last < scheduled_today <= now
+    elif schedule_str.endswith("h"):
+        hours = int(schedule_str[:-1])
+        return (now - last).total_seconds() >= hours * 3600
+    elif schedule_str.endswith("m"):
+        minutes = int(schedule_str[:-1])
+        return (now - last).total_seconds() >= minutes * 60
+    return False
+
+
+def check_schedules(r, sites, db_file):
+    """Re-seed queues for sites whose schedule has triggered."""
+    for site in sites:
+        schedule_str = SITES.get(site, {}).get("schedule")
+        if not schedule_str:
+            continue
+        last_run = r.get(f"last_schedule_run:{site}")
+        if _should_run_schedule(schedule_str, last_run):
+            logger.info(f"'{site}': planlagt kjøring trigget ({schedule_str}) — re-seeder kø")
+            seed_queues(r, [site], reset=True)
+            r.set(f"last_schedule_run:{site}", datetime.now().isoformat())
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +306,7 @@ def run_coordinator(sites=None, db_file=DATABASE_FILE, reset=True, interval=5):
                 logger.warning(f"Work-stealing: gjeninnkøyde {stolen} oppgave(r)")
 
             print_status(r, active_sites)
+            check_schedules(r, active_sites, db_file)
 
             if is_done(r, active_sites):
                 logger.success("Alle nettsteder er ferdig crawlet!")
