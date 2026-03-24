@@ -25,7 +25,7 @@ import redis as redis_lib
 from loguru import logger
 
 from config import SITES, MAX_RETRIES, HEADERS, DATABASE_FILE, REDIS_URL
-from db import save_products
+from db import save_products, get_selectors
 
 WORKER_ID          = os.getenv("WORKER_ID", f"{socket.gethostname()[:8]}-{str(uuid.uuid4())[:6]}")
 HEARTBEAT_INTERVAL = 10   # sekunder mellom heartbeats
@@ -78,71 +78,134 @@ def pop_task(r, queues):
 
 
 # ---------------------------------------------------------------------------
-# Statisk scraping (requests + BeautifulSoup)
+# Selektor-oppslag — DB-selektorer prioriteres over config.py
 # ---------------------------------------------------------------------------
 
-def _scrape_static(url):
+def _load_selectors(site, db_file):
+    """
+    Henter selektorer for et nettsted.
+    Prioritetsrekkefølge:
+      1. Validerte selektorer fra databasen (auto-oppdaget)
+      2. Selektorer fra config.py (manuelt konfigurert)
+    Returnerer dict med string-selektorer, eller None.
+    """
+    record = get_selectors(site, db_file)
+    if record and record["valid"]:
+        logger.debug(f"[{site}] Bruker selektorer fra DB (oppdaget {record['discovered_at']})")
+        return record["selectors"]
+
+    site_cfg = SITES.get(site, {})
+    cfg_sels = site_cfg.get("selectors")
+    if cfg_sels:
+        logger.debug(f"[{site}] Bruker selektorer fra config.py")
+        # Konverter tuple-format ("css", "...") til string-format
+        return {k: v[1] for k, v in cfg_sels.items()}
+
+    logger.error(f"[{site}] Ingen selektorer tilgjengelig — hopper over siden")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Generisk scraper — bruker CSS-selektorer fra DB eller config
+#
+# Strategi:
+#   1. Finn alle produkt-containere med "container"-selektoren
+#   2. Hent hvert felt (navn, pris osv.) relativt til containeren
+#   Denne tilnærmingen er robust mot manglende felt (returnerer tom streng)
+# ---------------------------------------------------------------------------
+
+def _extract_with_soup(soup, selectors):
+    """Statisk ekstraksjon med BeautifulSoup og CSS-selektorer."""
+    containers = soup.select(selectors.get("container", ""))
+    if not containers:
+        return None
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    records = []
+    for c in containers:
+        def txt(field):
+            sel = selectors.get(field)
+            if not sel:
+                return ""
+            el = c.select_one(sel)
+            return el.get_text(strip=True) if el else ""
+
+        def attr(field, attribute):
+            sel = selectors.get(field)
+            if not sel:
+                return ""
+            el = c.select_one(sel)
+            return el.get(attribute, "") if el else ""
+
+        records.append({
+            "Link":           attr("product_links", "href"),
+            "Product number": txt("productnumbers"),
+            "Title":          txt("names"),
+            "Description":    txt("descriptions"),
+            "Price":          txt("prices"),
+            "Quantity":       txt("quantities").strip("()"),
+            "Date":           now,
+        })
+    return records or None
+
+
+def _extract_with_selenium(driver, selectors):
+    """Dynamisk ekstraksjon med Selenium og CSS-selektorer."""
+    from selenium.webdriver.common.by import By
+
+    containers = driver.find_elements(By.CSS_SELECTOR, selectors.get("container", ""))
+    if not containers:
+        return None
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    records = []
+    for c in containers:
+        def txt(field):
+            sel = selectors.get(field)
+            if not sel:
+                return ""
+            try:
+                el = c.find_element(By.CSS_SELECTOR, sel)
+                return el.text.strip()
+            except Exception:
+                return ""
+
+        def attr(field, attribute):
+            sel = selectors.get(field)
+            if not sel:
+                return ""
+            try:
+                el = c.find_element(By.CSS_SELECTOR, sel)
+                return el.get_attribute(attribute) or ""
+            except Exception:
+                return ""
+
+        records.append({
+            "Link":           attr("product_links", "href"),
+            "Product number": txt("productnumbers"),
+            "Title":          txt("names"),
+            "Description":    txt("descriptions"),
+            "Price":          txt("prices"),
+            "Quantity":       txt("quantities").strip("()"),
+            "Date":           now,
+        })
+    return records or None
+
+
+def _scrape_static(url, selectors):
     import requests
     from bs4 import BeautifulSoup
 
     response = requests.get(url, headers=HEADERS, timeout=10)
     response.raise_for_status()
-
     soup = BeautifulSoup(response.content, "html.parser")
-    products = soup.findAll("div", class_="d4-row d4-listing-row")
-    if not products:
-        return None
+    return _extract_with_soup(soup, selectors)
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    records = []
-    for product in products:
-        try:
-            name          = product.find("span", class_="product-desc1")
-            description   = product.find("span", class_="product-desc2")
-            productnumber = product.find("span", class_="product-desc-prod-num")
-            link          = product.find("a",    class_="AdProductLink")
-
-            quantity = ""
-            sc = product.find("div", class_="DynamicStockTooltipContainer")
-            if sc:
-                spans = sc.findAll("span")
-                if spans:
-                    quantity = spans[0].text.strip("()").strip()
-
-            price = ""
-            pc = product.find("div", class_="d4-listing-cell d4-col-2 price-cell")
-            if pc:
-                lp = pc.find("div", class_="ListPriceContainer")
-                if lp:
-                    label = lp.find("div", class_="PriceLabelContainer")
-                    if label:
-                        span = label.find("span", id=re.compile(r"^adprice__1680"))
-                        if span:
-                            price = span.get("content", "")
-
-            records.append({
-                "Link":           link["href"] if link else "",
-                "Product number": productnumber.text if productnumber else "",
-                "Title":          name.text          if name          else "",
-                "Description":    description.text   if description   else "",
-                "Price":          price,
-                "Quantity":       quantity,
-                "Date":           now,
-            })
-        except Exception as e:
-            logger.warning(f"Feil ved produkt: {e}")
-    return records or None
-
-
-# ---------------------------------------------------------------------------
-# Dynamisk scraping (Selenium + Chromium)
-# ---------------------------------------------------------------------------
 
 def _scrape_dynamic(url, selectors):
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
-    from selenium.webdriver.common.by import By
 
     options = Options()
     options.add_argument("--headless=new")
@@ -164,33 +227,7 @@ def _scrape_dynamic(url, selectors):
     try:
         driver.get(url)
         time.sleep(REQUEST_DELAY)
-
-        names = driver.find_elements(By.CSS_SELECTOR, selectors["names"][1])
-        if not names:
-            return None
-
-        descriptions   = driver.find_elements(By.CSS_SELECTOR, selectors["descriptions"][1])
-        productnumbers = driver.find_elements(By.CSS_SELECTOR, selectors["productnumbers"][1])
-        product_links  = driver.find_elements(By.CSS_SELECTOR, selectors["product_links"][1])
-        prices         = driver.find_elements(By.XPATH,        selectors["prices"][1])
-        quantities     = driver.find_elements(By.CSS_SELECTOR, selectors["quantities"][1])
-
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        records = []
-        for i in range(len(names)):
-            try:
-                records.append({
-                    "Link":           product_links[i].get_attribute("href") if i < len(product_links) else "",
-                    "Product number": productnumbers[i].text                 if i < len(productnumbers) else "",
-                    "Title":          names[i].text,
-                    "Description":    descriptions[i].text                   if i < len(descriptions)   else "",
-                    "Price":          prices[i].text                         if i < len(prices)          else "",
-                    "Quantity":       quantities[i].text.strip("()").strip() if i < len(quantities)      else "",
-                    "Date":           now,
-                })
-            except Exception as e:
-                logger.warning(f"Feil ved produkt {i}: {e}")
-        return records or None
+        return _extract_with_selenium(driver, selectors)
     finally:
         driver.quit()
 
@@ -202,18 +239,23 @@ def _scrape_dynamic(url, selectors):
 def process_task(r, task, db_file):
     site      = task["site"]
     page      = task["page"]
-    site_cfg  = SITES[site]
-    url       = site_cfg["base_url"] + str(page)
+    site_cfg  = SITES.get(site, {})
+    url       = site_cfg.get("base_url", "") + str(page)
     is_dyn    = site_cfg.get("dynamic", False)
+
+    selectors = _load_selectors(site, db_file)
+    if not selectors:
+        logger.error(f"[{WORKER_ID}] Ingen selektorer for '{site}' — hopper over side {page}")
+        return
 
     logger.info(f"[{WORKER_ID}] {site} side {page} — {'dynamisk' if is_dyn else 'statisk'}")
 
     for attempt in range(MAX_RETRIES):
         try:
             records = (
-                _scrape_dynamic(url, site_cfg["selectors"])
+                _scrape_dynamic(url, selectors)
                 if is_dyn
-                else _scrape_static(url)
+                else _scrape_static(url, selectors)
             )
 
             if records:

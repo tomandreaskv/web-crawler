@@ -17,8 +17,9 @@ SITES = {
     },
 }
 
-REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379")
-STEAL_THRESHOLD = int(os.getenv("STEAL_THRESHOLD", "60"))  # sekunder før en worker regnes som dø
+REDIS_URL             = os.getenv("REDIS_URL", "redis://localhost:6379")
+STEAL_THRESHOLD       = int(os.getenv("STEAL_THRESHOLD", "60"))       # sekunder før en worker regnes som dø
+SELECTOR_MAX_AGE_DAYS = int(os.getenv("SELECTOR_MAX_AGE_DAYS", "7"))  # dager før selektorer re-valideres
 
 REQUEST_DELAY  = 1.5
 DATABASE_FILE  = os.getenv("DATABASE_FILE", "products.db")

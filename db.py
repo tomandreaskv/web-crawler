@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import datetime
 
@@ -45,6 +46,18 @@ def _connect(db_file):
             created_at     TEXT NOT NULL,
             triggered_at   TEXT,
             notified       INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS site_selectors (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            site          TEXT NOT NULL,
+            base_url      TEXT NOT NULL,
+            dynamic       INTEGER DEFAULT 0,
+            selectors     TEXT NOT NULL,   -- JSON: {"container": "...", "names": "...", ...}
+            hit_counts    TEXT NOT NULL,   -- JSON: {"container": 20, "names": 20, ...}
+            valid         INTEGER DEFAULT 1,
+            discovered_at TEXT NOT NULL,
+            validated_at  TEXT
         );
     """)
     conn.commit()
@@ -271,3 +284,79 @@ def delete_alert(alert_id, db_file):
     conn.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
     conn.commit()
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Selektorer — oppdagede og validerte CSS-selektorer per nettsted
+# ---------------------------------------------------------------------------
+
+def save_selectors(site, base_url, dynamic, selectors, hit_counts, valid, db_file):
+    """Lagrer et nytt sett med selektorer. Eldre rader beholdes som historikk."""
+    conn = _connect(db_file)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        """
+        INSERT INTO site_selectors
+            (site, base_url, dynamic, selectors, hit_counts, valid, discovered_at, validated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            site,
+            base_url,
+            int(dynamic),
+            json.dumps(selectors, ensure_ascii=False),
+            json.dumps(hit_counts),
+            int(valid),
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    status = "gyldig" if valid else "ugyldig"
+    logger.info(f"Selektorer lagret for '{site}' ({status})")
+
+
+def get_selectors(site, db_file):
+    """
+    Henter siste selektorer for et nettsted.
+    Returnerer dict med nøklene: site, base_url, dynamic, selectors, valid, discovered_at
+    — eller None hvis ingen finnes.
+    """
+    conn = _connect(db_file)
+    row = conn.execute(
+        """
+        SELECT site, base_url, dynamic, selectors, hit_counts, valid, discovered_at, validated_at
+        FROM site_selectors
+        WHERE site = ?
+        ORDER BY discovered_at DESC
+        LIMIT 1
+        """,
+        (site,),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "site":         row["site"],
+        "base_url":     row["base_url"],
+        "dynamic":      bool(row["dynamic"]),
+        "selectors":    json.loads(row["selectors"]),
+        "hit_counts":   json.loads(row["hit_counts"]),
+        "valid":        bool(row["valid"]),
+        "discovered_at": row["discovered_at"],
+        "validated_at": row["validated_at"],
+    }
+
+
+def get_selector_history(site, db_file):
+    """Alle historiske selektor-versjoner for et nettsted."""
+    conn = _connect(db_file)
+    rows = conn.execute(
+        "SELECT * FROM site_selectors WHERE site = ? ORDER BY discovered_at DESC",
+        (site,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
