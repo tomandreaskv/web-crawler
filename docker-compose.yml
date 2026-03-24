@@ -1,22 +1,66 @@
 services:
 
-  crawler:
+  # ---------------------------------------------------------------------------
+  # Redis — sentral kommunikasjonskanal mellom alle containere
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Koordinator — seeder køer, overvåker workers, stjeler stale oppgaver
+  # Kjør én instans.
+  # ---------------------------------------------------------------------------
+  coordinator:
     build: .
     volumes:
       - ./data:/app/data
     environment:
       - DATABASE_FILE=/app/data/products.db
       - LOG_FILE=/app/data/crawler.log
-      # Varsling via miljøvariabler (valgfritt):
-      # - SMTP_HOST=smtp.gmail.com
-      # - SMTP_PORT=587
-      # - SMTP_USER=din@gmail.com
-      # - SMTP_PASSWORD=passord
-      # - SMTP_FROM=din@gmail.com
-      # - NOTIFY_EMAIL=mottaker@eksempel.no
-      # - SLACK_WEBHOOK=https://hooks.slack.com/services/...
-    command: ["--schedule", "02:00", "--format", "csv,json", "--notify"]
+      - REDIS_URL=redis://redis:6379
+      - STEAL_THRESHOLD=60
+    entrypoint: ["python", "coordinator.py"]
+    depends_on:
+      redis:
+        condition: service_healthy
 
+  # ---------------------------------------------------------------------------
+  # Worker — scraper sider fra Redis-kø, støtter work-stealing
+  # Skaler med: docker compose up --scale worker=3
+  # ---------------------------------------------------------------------------
+  worker:
+    build: .
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DATABASE_FILE=/app/data/products.db
+      - LOG_FILE=/app/data/crawler.log
+      - REDIS_URL=redis://redis:6379
+      - CHROME_BIN=/usr/bin/chromium
+      - CHROMEDRIVER_PATH=/usr/bin/chromedriver
+      - REQUEST_DELAY=1.5
+      # Valgfritt: begrens til spesifikke nettsteder
+      # - WORKER_SITES=msorensen
+    entrypoint: ["python", "worker.py"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      coordinator:
+        condition: service_started
+
+  # ---------------------------------------------------------------------------
+  # REST API — tilgjengelig på http://localhost:8000/docs
+  # ---------------------------------------------------------------------------
   api:
     build: .
     volumes:
@@ -27,8 +71,12 @@ services:
       - "8000:8000"
     entrypoint: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
     depends_on:
-      - crawler
+      redis:
+        condition: service_healthy
 
+  # ---------------------------------------------------------------------------
+  # Dashboard — tilgjengelig på http://localhost:8501
+  # ---------------------------------------------------------------------------
   dashboard:
     build: .
     volumes:
@@ -39,4 +87,8 @@ services:
       - "8501:8501"
     entrypoint: ["streamlit", "run", "dashboard.py", "--server.address", "0.0.0.0"]
     depends_on:
-      - crawler
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis_data:

@@ -9,8 +9,10 @@ from loguru import logger
 # ---------------------------------------------------------------------------
 
 def _connect(db_file):
-    conn = sqlite3.connect(db_file)
+    conn = sqlite3.connect(db_file, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")   # tillater parallelle skrivinger fra flere workers
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS products (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
